@@ -5,5 +5,10 @@ numpy>=1.26
 pandas>=2.2
 tqdm>=4.66
 
+# Tracking / plotting (optional)
+matplotlib>=3.8      # src/plot_history.py
+# tensorboard        # set use_tb=True in Tracker
+# wandb              # set WANDB_API_KEY + use_wandb=True in Tracker
+
 # Phase 2 (serving, later) — not needed for Phase 1 training
 # modal>=0.64

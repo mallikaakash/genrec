@@ -87,13 +87,37 @@ def make_collate(tokenizer, max_len: int):
 # Phase 1 — domain adaptation (causal LM)
 # --------------------------------------------------------------------------- #
 def phase1_adapt(model: GenRec, tokenizer, ds: Dataset, device,
-                 epochs=1, lr=5e-5, max_len=96, batch_size=8, budget=10):
+                 epochs=1, lr=5e-5, max_len=96, batch_size=8, budget=10,
+                 tracker=None, log_every=20, val_every=100, gstep0=0):
     corpus = [verbalize_item(it) for it in ds.catalog.values()]
     corpus += [verbalize_history(ds.sequences[u][:-2], ds.catalog, budget=budget)
                for u in list(ds.sequences)[:2000]]
     random.shuffle(corpus)
+    n_val = max(batch_size, len(corpus) // 20)          # ~5% held out
+    val_corpus, corpus = corpus[:n_val], corpus[n_val:]
+
+    if tracker is not None and tracker.tokens_per_byte is None:
+        from tracker import tokens_per_byte
+        tracker.tokens_per_byte = tokens_per_byte(corpus, tokenizer)
+        print(f"[phase1] tokens/byte={tracker.tokens_per_byte:.3f}")
+
+    def _val_lm_loss():
+        model.eval()
+        with torch.no_grad():
+            tot, k = 0.0, 0
+            for i in range(0, len(val_corpus), batch_size):
+                enc = tokenizer(val_corpus[i:i + batch_size], return_tensors="pt",
+                                padding=True, truncation=True,
+                                max_length=max_len).to(device)
+                tot += lm_loss(model.lm_logits(enc["input_ids"], enc["attention_mask"]),
+                               enc["input_ids"], enc["attention_mask"]).item()
+                k += 1
+        model.train()
+        return tot / max(k, 1)
+
     opt = torch.optim.AdamW(model.backbone.parameters(), lr=lr)
     model.train()
+    gstep = gstep0
     for ep in range(epochs):
         total, n = 0.0, 0
         for i in range(0, len(corpus), batch_size):
@@ -103,9 +127,16 @@ def phase1_adapt(model: GenRec, tokenizer, ds: Dataset, device,
             logits = model.lm_logits(enc["input_ids"], enc["attention_mask"])
             loss = lm_loss(logits, enc["input_ids"], enc["attention_mask"])
             opt.zero_grad(); loss.backward(); opt.step()
-            total += loss.item(); n += 1
+            total += loss.item(); n += 1; gstep += 1
+
+            if tracker is not None and gstep % log_every == 0:
+                tracker.log(gstep, "phase1_train", **tracker.lm_stats(loss.item()))
+            if tracker is not None and gstep % val_every == 0:
+                vl = _val_lm_loss()
+                tracker.log(gstep, "phase1_val",
+                            **{("val_" + k): v for k, v in tracker.lm_stats(vl).items()})
         print(f"[phase1] epoch {ep+1} lm_loss={total/max(n,1):.4f}")
-    return model
+    return model, gstep
 
 
 # --------------------------------------------------------------------------- #
@@ -114,15 +145,45 @@ def phase1_adapt(model: GenRec, tokenizer, ds: Dataset, device,
 def phase2_rank(model: GenRec, tokenizer, ds: Dataset, device,
                 epochs=1, lr=1e-4, max_len=96, batch_size=8, budget=10,
                 n_neg=8, weights=(1.0, 0.1, 0.5), use_lm=True, use_reward=True,
-                max_examples=None):
+                max_examples=None, tracker=None, log_every=20, val_every=200,
+                val_users=400, gstep0=0):
     a, b, c = weights
     examples = training_examples(ds, max_examples=max_examples)
     print(f"[phase2] {len(examples)} training examples")
     data = RankingData(ds, examples, budget=budget, n_neg=n_neg)
     loader = DataLoader(data, batch_size=batch_size, shuffle=True,
                         collate_fn=make_collate(tokenizer, max_len))
+
+    # --- fixed validation batch (val_hist -> val item) for a stable val loss ---
+    val_batch = None
+    val_sample = []
+    if tracker is not None:
+        from eval import evaluate
+        val_ids = [u for u in ds.val if u in ds.val_hist]
+        val_sample = random.Random(1).sample(val_ids, min(val_users, len(val_ids)))
+        vb = RankingData(ds, [(u, ds.val_hist[u], ds.val[u], 5.0)
+                              for u in val_sample[:min(256, len(val_sample))]],
+                         budget=budget, n_neg=n_neg, seed=1)
+        val_batch = make_collate(tokenizer, max_len)([vb[i] for i in range(len(vb))])
+
+    def _val_metrics():
+        model.eval()
+        vi, va, vc, vr = (t.to(device) for t in val_batch)
+        with torch.no_grad():
+            uv = model.user_vector(vi, va)
+            sc = model.score_items(uv, vc)
+            vloss = ranking_loss(sc).item()
+            sc_val = GenRecScorer(model, tokenizer, ds, device, budget=budget,
+                                  which="val")
+            excl = {u: {it.item_id for it in ds.val_hist[u]} for u in val_sample}
+            m = evaluate(sc_val.scorer, {u: ds.val[u] for u in val_sample},
+                         ds.num_items, ks=(10,), exclude=excl)
+        model.train()
+        return vloss, m
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()
+    gstep = gstep0
     for ep in range(epochs):
         agg = {"rank": 0.0, "lm": 0.0, "rew": 0.0}; n = 0
         for input_ids, attn, cand, reward in loader:
@@ -140,10 +201,23 @@ def phase2_rank(model: GenRec, tokenizer, ds: Dataset, device,
 
             opt.zero_grad(); loss.backward(); opt.step()
             agg["rank"] += l_rank.item(); agg["lm"] += l_lm.detach().item()
-            agg["rew"] += l_rew.detach().item(); n += 1
+            agg["rew"] += l_rew.detach().item(); n += 1; gstep += 1
+
+            if tracker is not None and gstep % log_every == 0:
+                rec = {"loss_total": loss.item(), "loss_rank": l_rank.item(),
+                       "loss_reward": l_rew.detach().item()}
+                rec.update(tracker.lm_stats(l_lm.detach().item()))
+                tracker.log(gstep, "phase2_train", **rec)
+            if tracker is not None and val_batch is not None and gstep % val_every == 0:
+                vloss, vm = _val_metrics()
+                tracker.log(gstep, "phase2_val", val_loss_rank=vloss,
+                            val_MRR=vm["MRR"], val_Recall_10=vm["Recall@10"],
+                            val_NDCG_10=vm["NDCG@10"])
+                print(f"[phase2] step {gstep} val_rank={vloss:.4f} "
+                      f"val_MRR={vm['MRR']:.4f}")
         print(f"[phase2] epoch {ep+1} rank={agg['rank']/n:.4f} "
               f"lm={agg['lm']/n:.4f} reward={agg['rew']/n:.4f}")
-    return model
+    return model, gstep
 
 
 # --------------------------------------------------------------------------- #
@@ -194,10 +268,18 @@ def main():
         print(pretty(name, evaluate(m.scorer, ds.test, ds.num_items,
                                     ks=(10,), exclude=exclude)))
 
+    from tracker import Tracker
+    tracker = Tracker("artifacts/history_local.jsonl")
     print("\n--- GenRec Phase 1 ---")
-    phase1_adapt(model, tok, ds, device, epochs=args.p1_epochs, budget=args.budget)
+    _, gstep = phase1_adapt(model, tok, ds, device, epochs=args.p1_epochs,
+                            budget=args.budget, tracker=tracker,
+                            log_every=10, val_every=40)
     print("\n--- GenRec Phase 2 ---")
-    phase2_rank(model, tok, ds, device, epochs=args.p2_epochs, budget=args.budget)
+    _, gstep = phase2_rank(model, tok, ds, device, epochs=args.p2_epochs,
+                           budget=args.budget, tracker=tracker, gstep0=gstep,
+                           log_every=10, val_every=60, val_users=100)
+    tracker.close()
+    print(f"[local] logged {len(tracker.history())} records to artifacts/history_local.jsonl")
 
     print("\n--- GenRec eval ---")
     gr = GenRecScorer(model, tok, ds, device, budget=args.budget)
