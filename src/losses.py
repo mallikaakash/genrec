@@ -6,8 +6,11 @@ Blog mapping (Phase-2 combines three objectives):
   3. reward-weighted alignment — weight toward long-term satisfaction, not just
                                  "engaged once".
 
-Combined: L = a*rank + b*lm + c*reward. Each term is separable so we can ablate
-them (blog reports Phase-2 losses contributing 35-50% of ranking gains).
+Combined: L = a*rank_term + b*lm, where rank_term is the reward-SCALED ranking
+loss when the reward objective is on and the plain one when it is off. The blog
+scales the ranking loss by the reward rather than adding a second copy of it, so
+there are three objectives but two additive terms. Both are separately ablatable
+(blog reports Phase-2 losses contributing 35-50% of ranking gains).
 """
 from __future__ import annotations
 
@@ -24,22 +27,37 @@ def ranking_loss(scores: torch.Tensor) -> torch.Tensor:
 
 
 def reward_weighted_loss(scores: torch.Tensor, reward: torch.Tensor) -> torch.Tensor:
-    """Same contrastive objective, but each example is weighted by its reward
-    (e.g. normalized rating / long-term-satisfaction signal). High-reward
-    engagements dominate the gradient; fleeting/low-value ones count for less."""
+    """THE ranking loss, with each example's contribution scaled by its reward.
+
+    Blog: "The example's ranking loss is scaled by this weight: high-value
+    engagements receive larger weights." Note this REPLACES the plain ranking
+    loss rather than being added alongside it — adding an unweighted copy would
+    compress the effective weight ratio toward 1 and neuter the signal.
+
+    `reward` already comes normalized around 1.0 from rewards.build_reward_fn
+    (satisfaction x behaviour-rebalancing), so no batch-dependent renormalization
+    here: a batch that happens to be all-tail should keep its larger weights.
+    """
     target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
     per_ex = F.cross_entropy(scores, target, reduction="none")  # [B]
-    w = reward / reward.mean().clamp(min=1e-6)                   # normalize ~1
-    return (per_ex * w).mean()
+    return (per_ex * reward).mean()
 
 
 def lm_loss(logits: torch.Tensor, input_ids: torch.Tensor,
-            attention_mask: torch.Tensor) -> torch.Tensor:
-    """Standard next-token cross-entropy over the prompt (shifted), masking pads.
-    Keeps the backbone a competent language model while it learns to rank."""
+            attention_mask: torch.Tensor,
+            loss_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Next-token cross-entropy (shifted), masking pads.
+
+    In Phase 2 the sequence is [verbalized input + assistant turn] and the blog
+    puts the LM objective "over the verbalized inputs and outputs", so the
+    default (loss_mask=None) scores every real token. Pass `loss_mask` to score
+    only a span, e.g. the assistant turn alone.
+    """
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = input_ids[:, 1:].contiguous().clone()
     shift_mask = attention_mask[:, 1:].contiguous()
+    if loss_mask is not None:
+        shift_mask = shift_mask * loss_mask[:, 1:].contiguous()
     shift_labels[shift_mask == 0] = -100
     return F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
@@ -48,7 +66,11 @@ def lm_loss(logits: torch.Tensor, input_ids: torch.Tensor,
     )
 
 
-def combined_loss(rank, lm, reward, a=1.0, b=0.1, c=0.5):
-    """Weighted sum used in Phase 2. Weights are the knobs; b (LM) acts as the
-    'leash', c (reward) shapes which positives matter."""
-    return a * rank + b * lm + c * reward
+def combined_loss(rank_term, lm, a=1.0, b=0.1):
+    """Phase-2 total.
+
+    `rank_term` is the catalog-aware ranking loss, already reward-scaled when the
+    reward objective is on (that is the blog's formulation: one ranking loss,
+    weighted per example). `b` is the LM leash.
+    """
+    return a * rank_term + b * lm
