@@ -128,7 +128,31 @@ number.* Gaps of a few points are within run-to-run variance.
   keep. This contrast is the point: each loss is there for a reason, and the
   reason is visible when you remove the condition it depends on.
 
-Kaggle run (Qwen2.5-0.5B, Yelp) — _to be filled after the run_.
+### Real run — Amazon Beauty (Qwen2.5-0.5B on Modal A10G)
+
+Trained and evaluated on the **exact S3-Rec/TIGER Beauty slice** (22,363 users /
+12,101 items / 198,502 reviews), published protocol (leave-one-out + 99 sampled
+negatives + 5-core), 8,000 test users. First pass: 1 Phase-1 epoch, 2 Phase-2
+epochs, 60k capped training examples.
+
+| Model | MRR | HR@10 | NDCG@10 |
+|---|---|---|---|
+| Popularity (this run) | 0.1347 | 0.2995 | 0.1554 |
+| Item-kNN (this run) | 0.3103 | 0.6709 | 0.3788 |
+| **GenRec-Food (ours)** | **0.2180** | **0.3999** | **0.2466** |
+| — published SASRec | 0.2852 | 0.4696 | 0.3156 |
+| — published BERT4Rec | 0.2614 | 0.4739 | 0.2975 |
+| — published S3-Rec | 0.3340 | 0.5506 | 0.3732 |
+
+GenRec clears the popularity floor decisively and lands between it and the
+purpose-built sequential models — a respectable first pass for a general 0.5B LLM
+with a capped training set, with clear headroom (full data, more epochs, larger
+backbone, harder negatives). **Live training trace + charts:**
+[training report artifact](https://claude.ai/code/artifact/42e37e24-0a85-498f-8703-d27a36930d0c).
+Regenerate locally with `python src/generate_report.py`.
+
+Note: Item-kNN is unusually strong under 99-sampled-negative eval — a known
+phenomenon (Ferrari Dacrema et al., 2019); it's the real bar on this slice.
 
 ### Published Yelp benchmarks (the real bar)
 
