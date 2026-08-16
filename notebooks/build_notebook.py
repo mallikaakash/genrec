@@ -25,10 +25,21 @@ print("src:", SRC, "exists:", os.path.exists(SRC))"""),
 
     code("""!pip -q install "transformers>=4.44" "torch>=2.2" tqdm"""),
 
-    md("### 2. Load Yelp restaurants (one metro) → catalog + sequences"),
+    md("""### 2. Load Yelp → catalog + sequences
+
+Two presets:
+* **Portfolio** (Swiggy/Zomato flavor): restaurants in one metro.
+* **Paper-matched** (S3-Rec CIKM'20): all categories, reviews after 2019-01-01,
+  5-core — directly comparable to the published benchmark in `BENCHMARKS.md`."""),
     code("""from data import load_yelp
-YELP_DIR = "/kaggle/input/yelp-dataset"   # dir with yelp_academic_dataset_business.json + review.json
-ds = load_yelp(YELP_DIR, city=None, min_user_interactions=5, max_users=20000)
+YELP_DIR = "/kaggle/input/yelp-dataset"   # yelp_academic_dataset_business.json + review.json
+
+PAPER_MATCHED = False   # flip to True for the apples-to-apples S3-Rec Yelp slice
+if PAPER_MATCHED:
+    ds = load_yelp(YELP_DIR, city="", restaurants_only=False,
+                   after_date="2019-01-01", min_user_interactions=5)
+else:
+    ds = load_yelp(YELP_DIR, city=None, min_user_interactions=5, max_users=20000)
 print("items:", ds.num_items, "users:", len(ds.sequences), "eval users:", len(ds.test))"""),
 
     md("### 3. Baselines (the bar to beat)"),
@@ -71,6 +82,23 @@ print("no Phase-1 :", run("no_p1", do_phase1=False, **common))
 print("no LM loss :", run("no_lm", use_lm=False, **common))
 print("no reward  :", run("no_rew", use_reward=False, **common))
 print("context 1/3:", run("ctx13", **{**common, "budget": 3}))"""),
+
+    md("""### 9. Compare against published Yelp benchmarks
+
+Only meaningful with `PAPER_MATCHED = True` above (same slice + protocol).
+Published Yelp results (S3-Rec, CIKM 2020, Table 2 — see `BENCHMARKS.md`), all
+under leave-one-out + 99 sampled negatives + 5-core:
+
+| Model | HR@10 | NDCG@10 | MRR |
+|---|---|---|---|
+| PopRec | 0.3609 | 0.2007 | 0.1740 |
+| GRU4Rec | 0.7265 | 0.4375 | 0.3630 |
+| SASRec | 0.7373 | 0.4642 | 0.3927 |
+| BERT4Rec | 0.7597 | 0.4778 | 0.4026 |
+| S3-Rec | 0.7725 | 0.4934 | 0.4190 |
+
+Put your GenRec (Recall@10 = HR@10, plus NDCG@10 and MRR) next to this row.
+Landing near SASRec/BERT4Rec is a competitive result."""),
 ]
 
 nb = {"cells": cells,

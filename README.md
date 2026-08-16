@@ -128,7 +128,25 @@ number.* Gaps of a few points are within run-to-run variance.
   keep. This contrast is the point: each loss is there for a reason, and the
   reason is visible when you remove the condition it depends on.
 
-Kaggle run (Qwen2.5-0.5B, Yelp restaurants) — _to be filled after the run_.
+Kaggle run (Qwen2.5-0.5B, Yelp) — _to be filled after the run_.
+
+### Published Yelp benchmarks (the real bar)
+
+For an apples-to-apples target, [`BENCHMARKS.md`](BENCHMARKS.md) transcribes the
+**exact** published Yelp results from the S3-Rec paper (CIKM 2020, Table 2),
+whose protocol — leave-one-out + 99 sampled negatives + 5-core — is *identical*
+to this repo's `eval.py`. Run `load_yelp(..., city="", restaurants_only=False,
+after_date="2019-01-01", min_user_interactions=5)` (the "paper-matched" preset)
+to produce directly comparable numbers. Reference targets on Yelp:
+
+| Model | HR@10 | NDCG@10 | MRR |
+|---|---|---|---|
+| PopRec (floor) | 0.3609 | 0.2007 | 0.1740 |
+| SASRec | 0.7373 | 0.4642 | 0.3927 |
+| BERT4Rec | 0.7597 | 0.4778 | 0.4026 |
+| S3-Rec (best published) | 0.7725 | 0.4934 | 0.4190 |
+
+_Source: [arXiv:2008.07873](https://arxiv.org/abs/2008.07873), Table 2 (Yelp)._
 
 ---
 
