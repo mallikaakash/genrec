@@ -28,10 +28,14 @@ from verbalize import verbalize_history, verbalize_item
 # --------------------------------------------------------------------------- #
 # Training examples: prefix -> next-item, excluding held-out val/test targets.
 # --------------------------------------------------------------------------- #
-def training_examples(ds: Dataset, min_prefix: int = 1):
+def training_examples(ds: Dataset, min_prefix: int = 1, max_examples: int | None = None):
     """Yield (uid, history_prefix, positive_item_id, reward). Targets are
     seq[1 .. len-3] so we never train on the val (seq[-2]) or test (seq[-1])
-    items — no leakage."""
+    items — no leakage.
+
+    max_examples: if set, randomly subsample to this many (keeps a large real
+    run tractable). eval is always on the full/holdout, so this only trades
+    training signal for wall-clock, not evaluation integrity."""
     ex = []
     for uid, seq in ds.sequences.items():
         # last two are held out for val/test
@@ -39,6 +43,9 @@ def training_examples(ds: Dataset, min_prefix: int = 1):
             hist = seq[:t]
             pos = seq[t]
             ex.append((uid, hist, pos.item_id, pos.rating))
+    if max_examples and len(ex) > max_examples:
+        import random as _r
+        ex = _r.Random(0).sample(ex, max_examples)
     return ex
 
 
@@ -106,9 +113,11 @@ def phase1_adapt(model: GenRec, tokenizer, ds: Dataset, device,
 # --------------------------------------------------------------------------- #
 def phase2_rank(model: GenRec, tokenizer, ds: Dataset, device,
                 epochs=1, lr=1e-4, max_len=96, batch_size=8, budget=10,
-                n_neg=8, weights=(1.0, 0.1, 0.5), use_lm=True, use_reward=True):
+                n_neg=8, weights=(1.0, 0.1, 0.5), use_lm=True, use_reward=True,
+                max_examples=None):
     a, b, c = weights
-    examples = training_examples(ds)
+    examples = training_examples(ds, max_examples=max_examples)
+    print(f"[phase2] {len(examples)} training examples")
     data = RankingData(ds, examples, budget=budget, n_neg=n_neg)
     loader = DataLoader(data, batch_size=batch_size, shuffle=True,
                         collate_fn=make_collate(tokenizer, max_len))
