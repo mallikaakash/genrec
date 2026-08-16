@@ -3,7 +3,8 @@
     python plot_history.py artifacts/history.jsonl artifacts/plots
 
 Produces:
-  losses.png      — the 3 losses (rank / reward / total) over steps, train vs val
+  phase1.png      — Phase-1 adaptation: train vs val LM loss + perplexity
+  losses.png      — Phase-2: the 3 losses (rank / reward / total), train vs val
   lm_health.png   — LM perplexity + bits-per-token/byte (anti-forgetting check)
   val_ranking.png — val MRR / Recall@10 / NDCG@10 (the actual objective)
 """
@@ -34,6 +35,20 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     recs = load(hist)
+
+    # 0) Phase-1 adaptation: train vs val LM loss + perplexity (twin axis)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    xt, yt = series(recs, "phase1_train", "lm_loss")
+    xv, yv = series(recs, "phase1_val", "val_lm_loss")
+    if xt: ax.plot(xt, yt, label="train LM loss")
+    if xv: ax.plot(xv, yv, "--", label="val LM loss", linewidth=2)
+    ax.set_xlabel("step"); ax.set_ylabel("LM cross-entropy (nats)"); ax.legend(loc="upper right")
+    ax2 = ax.twinx()
+    xp, yp = series(recs, "phase1_train", "lm_perplexity")
+    if xp: ax2.plot(xp, yp, "r:", alpha=0.6, label="train perplexity")
+    ax2.set_ylabel("perplexity"); ax2.set_yscale("log")
+    ax.set_title("Phase 1 — domain adaptation (LM loss & perplexity)")
+    fig.tight_layout(); fig.savefig(outdir / "phase1.png", dpi=120); plt.close(fig)
 
     # 1) losses
     fig, ax = plt.subplots(figsize=(8, 5))

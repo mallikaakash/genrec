@@ -100,6 +100,46 @@ class GenRec(nn.Module):
         return self.score_items(uv, candidate_ids)
 
 
+def save_genrec(model: "GenRec", tokenizer, path: str, meta: dict | None = None):
+    """Persist a trained GenRec: adapted backbone + tokenizer (HF format) and the
+    ranking head (item-embedding table + optional MLP) + metadata. Downloadable
+    and reloadable with load_genrec()."""
+    import json
+    import os
+    os.makedirs(path, exist_ok=True)
+    model.backbone.save_pretrained(os.path.join(path, "backbone"))
+    tokenizer.save_pretrained(os.path.join(path, "backbone"))
+    head = {"item_emb": model.item_emb.state_dict(),
+            "scorer_kind": model.scorer_kind,
+            "num_items": model.num_items, "hidden_size": model.hidden_size}
+    if model.scorer_kind == "mlp":
+        head["mlp"] = model.mlp.state_dict()
+    torch.save(head, os.path.join(path, "ranking_head.pt"))
+    with open(os.path.join(path, "meta.json"), "w") as f:
+        json.dump(meta or {}, f, indent=2)
+    print(f"[save] wrote GenRec to {path}")
+
+
+def load_genrec(path: str, device: str = "cpu"):
+    """Reload a saved GenRec. Returns (model, tokenizer, meta)."""
+    import json
+    import os
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    backbone = AutoModelForCausalLM.from_pretrained(os.path.join(path, "backbone"))
+    tok = AutoTokenizer.from_pretrained(os.path.join(path, "backbone"))
+    head = torch.load(os.path.join(path, "ranking_head.pt"), map_location=device)
+    model = GenRec(backbone, head["hidden_size"], head["num_items"],
+                   scorer=head["scorer_kind"])
+    model.item_emb.load_state_dict(head["item_emb"])
+    if head["scorer_kind"] == "mlp":
+        model.mlp.load_state_dict(head["mlp"])
+    meta = {}
+    mp = os.path.join(path, "meta.json")
+    if os.path.exists(mp):
+        meta = json.load(open(mp))
+    return model.to(device), tok, meta
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     lm, tok, hid = build_backbone(tiny=True)

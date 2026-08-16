@@ -160,6 +160,25 @@ _Source: [arXiv:2008.07873](https://arxiv.org/abs/2008.07873), Table 2 (Yelp)._
 - The blog's **ablation shape**: Phase-1 helps, each loss contributes, and
   context can be cut to ⅓ with small degradation.
 
+## Downloading the trained model
+
+The Modal run saves the trained GenRec to the `genrec-out` Volume under `/model`:
+adapted backbone + tokenizer (HF format), the ranking head (item-embedding table
++ optional MLP), and `meta.json` (model name, catalog id→title map). Pull it:
+
+```bash
+modal volume get genrec-out model ./genrec_model      # ~1GB (0.5B backbone + head)
+```
+
+Reload and score locally:
+
+```python
+import sys; sys.path.insert(0, "src")
+from model import load_genrec
+model, tok, meta = load_genrec("genrec_model", device="cpu")
+# prefill-only scoring: verbalize a history -> user vector -> rank catalog items
+```
+
 ## Roadmap
 
 - **Phase 2 (this repo's next step): Modal serving.** A prefill-only inference

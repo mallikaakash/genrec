@@ -42,7 +42,7 @@ out_vol = modal.Volume.from_name("genrec-out", create_if_missing=True)
 def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
           p1_epochs: int = 1, p2_epochs: int = 2, budget: int = 10,
           max_users: int = 0, max_train_examples: int = 60000,
-          eval_users: int = 8000):
+          eval_users: int = 8000, save_model: bool = True):
     import sys
     sys.path.insert(0, "/root/src")
     import torch
@@ -128,6 +128,17 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
     print("\n" + "=" * 60 + f"\nRESULTS — {tag}")
     for name, mt in results.items():
         print(pretty(name, mt))
+
+    # --- persist the trained model to the Volume (downloadable) ---
+    if save_model:
+        from model import save_genrec
+        catalog = {i: {"name": it.name, "categories": it.categories}
+                   for i, it in ds.catalog.items()}
+        save_genrec(model, tok, "/out/model",
+                    meta={"model_name": model_name, "dataset": dataset,
+                          "num_items": ds.num_items, "catalog": catalog})
+        out_vol.commit()
+        print("[save] model committed to volume 'genrec-out' at /model")
 
     out = {"tag": tag, "results": results, "history": tracker.history(),
            "items": ds.num_items, "users": len(ds.sequences),
