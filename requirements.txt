@@ -1,0 +1,9 @@
+# Core
+torch>=2.2
+transformers>=4.44
+numpy>=1.26
+pandas>=2.2
+tqdm>=4.66
+
+# Phase 2 (serving, later) — not needed for Phase 1 training
+# modal>=0.64
