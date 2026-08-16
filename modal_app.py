@@ -185,7 +185,7 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
 @app.function(
     image=image,
     gpu="A10G",
-    timeout=6 * 60 * 60,
+    timeout=8 * 60 * 60,
     volumes={"/data": yelp_vol, "/root/.cache/huggingface": hf_cache,
              "/out": out_vol},
 )
@@ -214,15 +214,19 @@ def ablate(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B"
     eval_items, exclude = eval_slice(ds, eval_users)
     common = dict(ds=ds, device=device, model_name=model_name, tiny=False,
                   budget=budget, p1_epochs=p1_epochs, p2_epochs=p2_epochs,
-                  batch_size=16, max_examples=max_train_examples,
+                  max_examples=max_train_examples,
                   eval_items=eval_items, exclude=exclude)
 
-    results = run_suite(common, ds, eval_items, exclude)
-    with open(f"{outdir}/ablations.json", "w") as f:
-        _json.dump({"dataset": dataset, "eval_users": len(eval_items),
-                    "max_train_examples": max_train_examples,
-                    "results": results}, f, indent=2)
-    out_vol.commit()
+    # Persist after every arm so a mid-suite failure keeps completed arms.
+    def _save(results):
+        with open(f"{outdir}/ablations.json", "w") as f:
+            _json.dump({"dataset": dataset, "eval_users": len(eval_items),
+                        "max_train_examples": max_train_examples,
+                        "p2_epochs": p2_epochs, "results": results}, f, indent=2)
+        out_vol.commit()
+
+    results = run_suite(common, ds, eval_items, exclude, on_result=_save)
+    _save(results)
     print(f"[ablate] wrote {outdir}/ablations.json")
     return results
 
