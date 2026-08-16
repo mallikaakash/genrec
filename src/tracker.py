@@ -22,12 +22,16 @@ from pathlib import Path
 class Tracker:
     def __init__(self, path: str | Path, use_tb: bool = False,
                  use_wandb: bool = False, run_name: str | None = None,
-                 config: dict | None = None, tokens_per_byte: float | None = None):
+                 config: dict | None = None, tokens_per_byte: float | None = None,
+                 commit_fn=None, commit_every: int = 10):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._f = open(self.path, "w")
         self.records: list[dict] = []
         self.tokens_per_byte = tokens_per_byte
+        self.commit_fn = commit_fn          # e.g. modal Volume.commit — durable saves
+        self.commit_every = commit_every
+        self._since_commit = 0
         self.tb = None
         self.wandb = None
 
@@ -55,6 +59,14 @@ class Tracker:
                 self.tb.add_scalar(f"{phase}/{k}", v, step)
         if self.wandb:
             self.wandb.log({f"{phase}/{k}": v for k, v in metrics.items()}, step=step)
+        self._since_commit += 1
+        if self.commit_fn and self._since_commit >= self.commit_every:
+            self._f.flush()
+            try:
+                self.commit_fn()            # persist JSONL to durable storage
+            except Exception as e:          # pragma: no cover
+                print(f"[tracker] commit failed: {e}")
+            self._since_commit = 0
 
     def lm_stats(self, loss: float) -> dict:
         """Derive LM health metrics from a cross-entropy loss (nats/token)."""

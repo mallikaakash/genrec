@@ -28,13 +28,16 @@ image = (
 yelp_vol = modal.Volume.from_name("yelp-data", create_if_missing=True)
 # Cache HF model weights across runs so we don't re-download Qwen every time.
 hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
+# Durable outputs (history + results) — survives client disconnect / mid-run kill.
+out_vol = modal.Volume.from_name("genrec-out", create_if_missing=True)
 
 
 @app.function(
     image=image,
     gpu="A10G",
     timeout=90 * 60,
-    volumes={"/data": yelp_vol, "/root/.cache/huggingface": hf_cache},
+    volumes={"/data": yelp_vol, "/root/.cache/huggingface": hf_cache,
+             "/out": out_vol},
 )
 def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
           p1_epochs: int = 1, p2_epochs: int = 2, budget: int = 10,
@@ -100,11 +103,15 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
           f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     # --- full training tracking: 3 losses, perplexity/bpb, train vs val ---
+    # History is written to the /out Volume and committed periodically, so a
+    # client disconnect or mid-run kill still leaves the trace on durable storage.
+    import json as _json
     from tracker import Tracker
-    tracker = Tracker("/root/.cache/genrec_history.jsonl", use_tb=False,
+    tracker = Tracker("/out/history.jsonl", use_tb=False,
                       use_wandb=bool(__import__("os").environ.get("WANDB_API_KEY")),
                       run_name=tag, config={"dataset": dataset, "model": model_name,
-                                            "p1_epochs": p1_epochs, "p2_epochs": p2_epochs})
+                                            "p1_epochs": p1_epochs, "p2_epochs": p2_epochs},
+                      commit_fn=out_vol.commit, commit_every=5)
 
     _, gstep = phase1_adapt(model, tok, ds, device, epochs=p1_epochs, budget=budget,
                             batch_size=16, tracker=tracker)
@@ -112,6 +119,7 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
                            batch_size=16, n_neg=8, max_examples=max_train_examples,
                            tracker=tracker, gstep0=gstep)
     tracker.close()
+    out_vol.commit()   # durable history before the (slower) final test eval
 
     gr = GenRecScorer(model, tok, ds, device, budget=budget)
     results["GenRec"] = evaluate(gr.scorer, eval_items, ds.num_items, ks=(5, 10),
@@ -120,9 +128,16 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
     print("\n" + "=" * 60 + f"\nRESULTS — {tag}")
     for name, mt in results.items():
         print(pretty(name, mt))
-    return {"tag": tag, "results": results, "history": tracker.history(),
-            "items": ds.num_items, "users": len(ds.sequences),
-            "eval_users": len(eval_items)}
+
+    out = {"tag": tag, "results": results, "history": tracker.history(),
+           "items": ds.num_items, "users": len(ds.sequences),
+           "eval_users": len(eval_items)}
+    # durable results on the Volume (retrievable with `modal volume get genrec-out`)
+    with open("/out/results.json", "w") as f:
+        _json.dump({k: out[k] for k in ("tag", "results", "items", "users",
+                                        "eval_users")}, f, indent=2)
+    out_vol.commit()
+    return out
 
 
 @app.local_entrypoint()
