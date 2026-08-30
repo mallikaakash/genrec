@@ -268,12 +268,10 @@ plain CPU for the same model, a 25x slowdown. Use `--tiny` on CPU.
 
 ## Part 5: Still open, and honest caveats
 
-1. **The real-data ablations have not been run yet.** The code and a Modal function
-   exist (`modal_app.py: ablate`, 8 arms: no Phase 1, no LM loss, no reward
-   weighting, no item text, uniform negatives, last-token pooling, context 1/3,
-   and the full model). Running them is a separate multi-hour GPU job. Until then,
-   the per-change attribution in Part 2 is reasoning, not measurement. **The +26.2%
-   is the sum of twelve changes; we cannot yet say which ones earned it.**
+1. **Three of the twelve changes actively HURT offline MRR.** See Part 7: the
+   ablations have now run, and popularity-sampled negatives, mean pooling, and
+   reward weighting each cost measurable MRR. The v2 config is therefore not the
+   best available config, only a more faithful one.
 2. **Cold start is implemented but not measured.** Every item in the Beauty 5-core
    slice appears at least 5 times, so this benchmark structurally cannot test the
    cold-start path. A held-out-items evaluation would be needed.
@@ -321,3 +319,58 @@ Local smoke test, on CPU rather than MPS:
 ```bash
 python src/train.py --tiny --p2-epochs 3
 ```
+
+---
+
+## Part 7: Real-data ablations
+
+Run on Amazon Beauty at a reduced budget (20,000 training examples, 1 Phase-2
+epoch, 2,000 eval users) so eight arms fit one job. Phase 1 is trained once and
+shared by every arm that uses it. **Compare arms against each other, not against
+the 0.2752 headline**, which used 3x the data and 2x the epochs.
+
+Raw results: [`docs/v2/ablations.json`](docs/v2/ablations.json).
+
+| arm | MRR | vs full | what the removed thing was worth |
+|---|---|---|---|
+| **GenRec (full)** | **0.2140** | | |
+| no item text | 0.1552 | **-27.5%** | item text is the biggest single win |
+| no Phase 1 | 0.1946 | **-9.0%** | Phase 1 worth +10.0% |
+| no LM loss | 0.2221 | +3.8% | small ranking cost |
+| context 1/3 | 0.2212 | +3.4% | cheaper AND slightly better |
+| last-token pooling | 0.2298 | +7.4% | mean pooling was the wrong default |
+| uniform negatives | 0.2393 | +11.8% | popularity sampling was a mistake |
+| no reward weighting | 0.2436 | +13.8% | faithful, but expensive |
+| Popularity | 0.1404 | | |
+| Item-kNN | 0.3118 | | |
+
+### What this confirms from the blog
+
+* **Phase 1 is worth +10.0%.** The blog claims Phase-1 adaptation beats a raw
+  open-source backbone by "10-20%". Dead on the lower bound.
+* **Context to one third costs nothing.** The blog reports "negligible
+  degradation" at roughly one-third the tokens. We measured a small *gain*
+  (+3.4%), and [`SERVING.md`](SERVING.md) shows it also halves serving cost.
+
+### What this overturns
+
+* **Popularity-sampled negatives were a mistake (-11.8%).** The intent was to fix
+  a train/eval mismatch, but evaluation uses 99 *uniform* negatives, so training
+  on uniform negatives matches the eval distribution. One mismatch was traded for
+  a worse one.
+* **Mean pooling was the wrong default (-7.4%).** The audit originally recommended
+  last-token pooling, then a toy experiment on a *randomly initialised* 2-layer
+  backbone reversed the call. With a real pretrained Qwen the final position does
+  carry a good summary, exactly as the causal-mask argument predicted. The toy was
+  not a valid proxy for this decision.
+* **Reward weighting costs 13.8% offline MRR.** This one is *not* a bug. It is a
+  faithful implementation of a deliberate blog choice: inverse-propensity
+  weighting down-weights popular positives, but the test set is drawn from that
+  same popularity-biased distribution, so offline MRR structurally cannot see the
+  benefit. Keep it, and know the price.
+
+### The implied better configuration
+
+Item text on, uniform negatives, last-token pooling, budget 3, and reward
+weighting off if optimising for offline MRR. Not yet run, but it should beat
+0.2752 while being roughly half as expensive to serve.

@@ -47,18 +47,39 @@ class Server:
     def web(self):
         from fastapi import FastAPI, HTTPException
         from pydantic import BaseModel
-        from prometheus_client import Counter, Histogram, generate_latest
+        from prometheus_client import Counter, Gauge, Histogram, generate_latest
+        from collections import Counter as PyCounter
         from fastapi.responses import PlainTextResponse
         import torch, time
 
         api = FastAPI(title="GenRec prefill-only serving")
         svc = self.svc
 
+        # --- LABEL CARDINALITY ---------------------------------------------
+        # Every distinct label VALUE creates its own time series. Labelling by
+        # item_id would mint 12,101 series from one metric, which is how you
+        # melt a Prometheus. Rule of thumb: labels must be low-cardinality and
+        # bounded (endpoint, stage, status). Never user_id, item_id, or a
+        # timestamp. Per-item behaviour is tracked in-process below and exposed
+        # as a handful of AGGREGATE gauges instead.
         REQS = Counter("genrec_requests_total", "requests", ["endpoint"])
         LAT = Histogram("genrec_latency_ms", "stage latency (ms)", ["stage"],
                         buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000))
-        SERVED = Counter("genrec_items_served_total", "times an item was returned",
-                         ["item_id"])
+        TOKENS = Histogram("genrec_prompt_tokens", "prompt tokens per request",
+                           buckets=(32, 64, 96, 128, 192, 256, 384, 512, 768))
+        BATCH = Histogram("genrec_batch_size", "requests per forward pass",
+                          buckets=(1, 2, 4, 8, 16, 32, 64))
+        CATALOG = Gauge("genrec_catalog_items", "items currently servable")
+        COVERAGE = Gauge("genrec_catalog_coverage_ratio",
+                         "fraction of the catalog ever recommended")
+        CONCENTRATION = Gauge("genrec_served_head_share",
+                              "share of recommendations taken by the top 1% "
+                              "most-served items (1.0 = total popularity collapse)")
+        GINI = Gauge("genrec_served_gini",
+                     "Gini of the served-item distribution (0 = uniform)")
+
+        # in-process, NOT a Prometheus label: bounded memory, no series blowup
+        served_counts = PyCounter()
 
         class Interaction(BaseModel):
             item_id: int
@@ -89,8 +110,10 @@ class Server:
                                           exclude_seen=req.exclude_seen)
             for stage in ("verbalize_ms", "prefill_ms", "rank_ms", "total_ms"):
                 LAT.labels(stage.replace("_ms", "")).observe(t[stage])
+            TOKENS.observe(t["prompt_tokens_mean"])
+            BATCH.observe(t["batch"])
             for r in recs[0]:
-                SERVED.labels(str(r.item_id)).inc()
+                served_counts[r.item_id] += 1
             return {"recommendations": [r.__dict__ for r in recs[0]], "timing": t}
 
         @api.post("/recommend/batch")
@@ -168,6 +191,21 @@ class Server:
 
         @api.get("/metrics")
         def metrics():
+            """Prometheus scrapes this. Aggregates are computed at scrape time
+            so the hot request path stays free of bookkeeping."""
+            CATALOG.set(svc.num_items)
+            total = sum(served_counts.values())
+            if total:
+                counts = sorted(served_counts.values(), reverse=True)
+                COVERAGE.set(len(counts) / max(svc.num_items, 1))
+                head_n = max(1, svc.num_items // 100)
+                CONCENTRATION.set(sum(counts[:head_n]) / total)
+                # Gini over the served distribution, padded with the items that
+                # were never served (they are genuine zeros, not missing data).
+                vals = sorted(counts + [0] * max(0, svc.num_items - len(counts)))
+                n = len(vals)
+                cum = sum((i + 1) * v for i, v in enumerate(vals))
+                GINI.set((2 * cum) / (n * sum(vals)) - (n + 1) / n if sum(vals) else 0.0)
             return PlainTextResponse(generate_latest())
 
         return api
