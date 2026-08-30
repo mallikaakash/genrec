@@ -1,0 +1,48 @@
+{
+  "tag": "Amazon Beauty (2014 5-core \u2014 comparable to S3-Rec/TIGER)",
+  "results": {
+    "Popularity": {
+      "MRR": 0.1346886489268632,
+      "Recall@5": 0.18125,
+      "NDCG@5": 0.11728688294090407,
+      "Recall@10": 0.2995,
+      "NDCG@10": 0.1554050893077341
+    },
+    "ItemKNN": {
+      "MRR": 0.3103487168153116,
+      "Recall@5": 0.44425,
+      "NDCG@5": 0.3057850237587838,
+      "Recall@10": 0.670875,
+      "NDCG@10": 0.3788010459033697
+    },
+    "GenRec": {
+      "MRR": 0.2751841357168219,
+      "Recall@5": 0.37475,
+      "NDCG@5": 0.2761327380129764,
+      "Recall@10": 0.47975,
+      "NDCG@10": 0.31012534773535755
+    }
+  },
+  "items": 12101,
+  "users": 22363,
+  "eval_users": 8000,
+  "config": {
+    "dataset": "amazon_beauty",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "p1_epochs": 1,
+    "p2_epochs": 2,
+    "max_len": 384,
+    "n_neg": 16,
+    "backbone_lr": 2e-05,
+    "head_lr": 0.001,
+    "use_item_text": true,
+    "hard_negatives": true,
+    "budget": 10,
+    "run_tag": "v2",
+    "pooling": "mean",
+    "p1_batch": 8,
+    "p2_batch": 4,
+    "grad_accum": 4,
+    "eff_batch": 16
+  }
+}

@@ -35,16 +35,24 @@ out_vol = modal.Volume.from_name("genrec-out", create_if_missing=True)
 @app.function(
     image=image,
     gpu="A10G",
-    timeout=90 * 60,
+    # longer prompts (96 -> 384 tokens) and more negatives cost more per step than
+    # the v1 run, even though dropping the duplicate forward pass claws half back.
+    timeout=4 * 60 * 60,
     volumes={"/data": yelp_vol, "/root/.cache/huggingface": hf_cache,
              "/out": out_vol},
 )
 def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
           p1_epochs: int = 1, p2_epochs: int = 2, budget: int = 10,
           max_users: int = 0, max_train_examples: int = 60000,
-          eval_users: int = 8000, save_model: bool = True):
+          eval_users: int = 8000, save_model: bool = True,
+          run_tag: str = "v2", max_len: int = 384, n_neg: int = 16,
+          backbone_lr: float = 2e-5, head_lr: float = 1e-3,
+          use_item_text: bool = True, hard_negatives: bool = True,
+          pooling: str = "mean", p1_batch: int = 8,
+          p2_batch: int = 4, grad_accum: int = 4):
     import sys
     sys.path.insert(0, "/root/src")
+    import os
     import torch
 
     import verbalize
@@ -53,6 +61,12 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
     from baselines import PopularityBaseline, ItemKNNBaseline
     from eval import evaluate, pretty
     from train import phase1_adapt, phase2_rank, GenRecScorer
+
+    # long prompts + a 151936-wide vocab make the logits tensor the memory
+    # bottleneck; expandable segments keeps fragmentation from compounding it.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    outdir = f"/out/{run_tag}"
+    os.makedirs(outdir, exist_ok=True)
 
     print("CUDA available:", torch.cuda.is_available(),
           "| device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
@@ -98,7 +112,8 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
         print(pretty(name, results[name]))
 
     lm, tok, hid = build_backbone(model_name, tiny=False)
-    model = GenRec(lm, hid, num_items=ds.num_items, scorer="dot").to(device)
+    model = GenRec(lm, hid, num_items=ds.num_items, scorer="dot",
+                   pooling=pooling, use_item_text=use_item_text).to(device)
     print(f"\nbackbone={model_name} hidden={hid} params="
           f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
@@ -107,21 +122,36 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
     # client disconnect or mid-run kill still leaves the trace on durable storage.
     import json as _json
     from tracker import Tracker
-    tracker = Tracker("/out/history.jsonl", use_tb=False,
-                      use_wandb=bool(__import__("os").environ.get("WANDB_API_KEY")),
-                      run_name=tag, config={"dataset": dataset, "model": model_name,
-                                            "p1_epochs": p1_epochs, "p2_epochs": p2_epochs},
+    cfg = {"dataset": dataset, "model": model_name, "p1_epochs": p1_epochs,
+           "p2_epochs": p2_epochs, "max_len": max_len, "n_neg": n_neg,
+           "backbone_lr": backbone_lr, "head_lr": head_lr,
+           "use_item_text": use_item_text, "hard_negatives": hard_negatives,
+           "budget": budget, "run_tag": run_tag, "pooling": pooling,
+           "p1_batch": p1_batch, "p2_batch": p2_batch,
+           "grad_accum": grad_accum, "eff_batch": p2_batch * grad_accum}
+    tracker = Tracker(f"{outdir}/history.jsonl", use_tb=False,
+                      use_wandb=bool(os.environ.get("WANDB_API_KEY")),
+                      run_name=f"{tag} [{run_tag}]", config=cfg,
                       commit_fn=out_vol.commit, commit_every=5)
 
     _, gstep = phase1_adapt(model, tok, ds, device, epochs=p1_epochs, budget=budget,
-                            batch_size=16, tracker=tracker)
+                            batch_size=p1_batch, max_len=max_len, tracker=tracker)
+    # cold-start grounding: encode every item's metadata with the ADAPTED backbone
+    from verbalize import verbalize_item
+    model.build_item_text_embeddings(tok, ds.catalog, verbalize_item, device)
+    out_vol.commit()
+
     _, gstep = phase2_rank(model, tok, ds, device, epochs=p2_epochs, budget=budget,
-                           batch_size=16, n_neg=8, max_examples=max_train_examples,
+                           batch_size=p2_batch, grad_accum=grad_accum,
+                           n_neg=n_neg, max_len=max_len,
+                           backbone_lr=backbone_lr, head_lr=head_lr,
+                           hard_negatives=hard_negatives,
+                           max_examples=max_train_examples,
                            tracker=tracker, gstep0=gstep)
     tracker.close()
     out_vol.commit()   # durable history before the (slower) final test eval
 
-    gr = GenRecScorer(model, tok, ds, device, budget=budget)
+    gr = GenRecScorer(model, tok, ds, device, budget=budget, max_len=max_len)
     results["GenRec"] = evaluate(gr.scorer, eval_items, ds.num_items, ks=(5, 10),
                                  exclude=exclude)
 
@@ -134,21 +164,71 @@ def train(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
         from model import save_genrec
         catalog = {i: {"name": it.name, "categories": it.categories}
                    for i, it in ds.catalog.items()}
-        save_genrec(model, tok, "/out/model",
+        save_genrec(model, tok, f"{outdir}/model",
                     meta={"model_name": model_name, "dataset": dataset,
-                          "num_items": ds.num_items, "catalog": catalog})
+                          "num_items": ds.num_items, "catalog": catalog,
+                          "config": cfg})
         out_vol.commit()
-        print("[save] model committed to volume 'genrec-out' at /model")
+        print(f"[save] model committed to volume 'genrec-out' at /{run_tag}/model")
 
     out = {"tag": tag, "results": results, "history": tracker.history(),
            "items": ds.num_items, "users": len(ds.sequences),
-           "eval_users": len(eval_items)}
+           "eval_users": len(eval_items), "config": cfg}
     # durable results on the Volume (retrievable with `modal volume get genrec-out`)
-    with open("/out/results.json", "w") as f:
+    with open(f"{outdir}/results.json", "w") as f:
         _json.dump({k: out[k] for k in ("tag", "results", "items", "users",
-                                        "eval_users")}, f, indent=2)
+                                        "eval_users", "config")}, f, indent=2)
     out_vol.commit()
     return out
+
+
+@app.function(
+    image=image,
+    gpu="A10G",
+    timeout=8 * 60 * 60,
+    volumes={"/data": yelp_vol, "/root/.cache/huggingface": hf_cache,
+             "/out": out_vol},
+)
+def ablate(dataset: str = "amazon_beauty", model_name: str = "Qwen/Qwen2.5-0.5B",
+           p1_epochs: int = 1, p2_epochs: int = 1, budget: int = 10,
+           max_train_examples: int = 20000, eval_users: int = 2000,
+           run_tag: str = "v2"):
+    """The blog's ablations, on REAL data (they previously only ran on synthetic).
+
+    One arm per Phase-2 design decision, each a fresh model. Smaller training
+    budget than the headline run so seven arms fit in one job.
+    """
+    import sys, os, json as _json
+    sys.path.insert(0, "/root/src")
+    import torch
+
+    from ablations import load_dataset, eval_slice, run_suite
+
+    # long prompts + a 151936-wide vocab make the logits tensor the memory
+    # bottleneck; expandable segments keeps fragmentation from compounding it.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    outdir = f"/out/{run_tag}"
+    os.makedirs(outdir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ds = load_dataset(dataset)
+    eval_items, exclude = eval_slice(ds, eval_users)
+    common = dict(ds=ds, device=device, model_name=model_name, tiny=False,
+                  budget=budget, p1_epochs=p1_epochs, p2_epochs=p2_epochs,
+                  max_examples=max_train_examples,
+                  eval_items=eval_items, exclude=exclude)
+
+    # Persist after every arm so a mid-suite failure keeps completed arms.
+    def _save(results):
+        with open(f"{outdir}/ablations.json", "w") as f:
+            _json.dump({"dataset": dataset, "eval_users": len(eval_items),
+                        "max_train_examples": max_train_examples,
+                        "p2_epochs": p2_epochs, "results": results}, f, indent=2)
+        out_vol.commit()
+
+    results = run_suite(common, ds, eval_items, exclude, on_result=_save)
+    _save(results)
+    print(f"[ablate] wrote {outdir}/ablations.json")
+    return results
 
 
 @app.local_entrypoint()

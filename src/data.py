@@ -34,8 +34,13 @@ class Item:
 @dataclass
 class Interaction:
     item_id: int
-    rating: float  # this user's rating (reward signal)
+    rating: float  # this user's rating (short-term satisfaction signal)
     ts: int        # unix timestamp, for chronological ordering
+    # Long-term-satisfaction proxy in [0, 1]: how *invested* the user was in this
+    # interaction beyond the star it left (blog: "long-term satisfaction proxies"
+    # such as watch duration / downstream retention). On Amazon we derive it from
+    # review effort + helpfulness votes; datasets without it default to neutral.
+    engagement: float = 0.5
 
 
 @dataclass
