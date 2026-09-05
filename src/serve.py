@@ -84,58 +84,51 @@ class TorchEncoder:
 
 
 class VLLMEncoder:
-    """vLLM serving the backbone as a POOLING (embedding) model.
+    """vLLM serving the backbone as a POOLING model. YOU IMPLEMENT THIS.
 
-    vLLM's marquee features (PagedAttention, continuous batching of decode,
-    speculative decoding) target autoregressive generation and are largely moot
-    here: our KV cache is built once and discarded. What we actually want from
-    vLLM is batched prefill, CUDA graphs, and a production server loop.
+    See VLLM_TASK.md. Run `pytest tests/ -v` to check your work: the
+    conformance test asserts your encoder ranks items identically to the
+    TorchEncoder, which is the only definition of "correct" that matters.
 
-    NOTE ON NORMALIZATION: vLLM's embedding path L2-normalizes by default. That
-    is harmless for us: dividing every candidate score for ONE user by the same
-    ||h|| is a monotone transform within that query, so the ranking is
-    unchanged. It would NOT be harmless with scorer="mlp".
+    Contract
+    --------
+    __init__(self, endpoint: str, model: str, max_len: int = 384)
+        `endpoint` is the base URL of a running vLLM server, e.g.
+        "http://vllm:8000". Do NOT load the model in-process; the whole point
+        is that vLLM owns the GPU and this class is a client.
 
-    vLLM's pooling API has been renamed across releases (older: task="embed";
-    newer: runner="pooling" + convert="embed"). We try the variants in order.
+    encode(self, prompts: list[str]) -> tuple[torch.Tensor, list[int]]
+        Returns (user_vectors [B, D] float32, token_counts).
+        D must equal the backbone hidden size (896 for Qwen2.5-0.5B).
+
+    Things that will bite you, in the order they will bite you
+    ----------------------------------------------------------
+    1. vLLM must run as a POOLING/embedding model, not a generate model. You
+       want a hidden state, not tokens. The flag has been renamed across
+       releases (older: --task embed; newer: --runner pooling --convert embed).
+       Check the version you pull.
+    2. Pooling type MUST match training. This checkpoint used MEAN pooling over
+       non-pad tokens of the final post-norm hidden state. Getting CLS or LAST
+       here silently produces garbage that still returns 200 OK.
+    3. vLLM L2-normalizes embeddings by default. That is HARMLESS for us,
+       because dividing all of one user's candidate scores by the same ||h|| is
+       a monotone transform within that query and cannot reorder the ranking.
+       It would NOT be harmless with scorer="mlp". Convince yourself of this
+       before you "fix" it.
+    4. The ranking head stays HERE, not in vLLM. vLLM returns h; GenRecService
+       does h @ item_matrix.T. That matmul is ~11 MFLOPs, about 1% of serving
+       cost, so there is nothing to gain by moving it.
     """
 
     name = "vllm"
 
-    def __init__(self, model_path: str, max_len=384, pooling="MEAN",
-                 gpu_memory_utilization=0.45, enforce_eager=False):
-        from vllm import LLM
-        from vllm.config import PoolerConfig
-
-        common = dict(model=model_path, max_model_len=max_len,
-                      gpu_memory_utilization=gpu_memory_utilization,
-                      enforce_eager=enforce_eager,
-                      override_pooler_config=PoolerConfig(pooling_type=pooling,
-                                                          normalize=False))
-        errors = []
-        for kwargs in ({"runner": "pooling", "convert": "embed"},
-                       {"task": "embed"},
-                       {}):
-            try:
-                self.llm = LLM(**common, **kwargs)
-                self.api = kwargs
-                break
-            except (TypeError, ValueError) as e:
-                errors.append(f"{kwargs}: {type(e).__name__}: {e}")
-        else:
-            raise RuntimeError("could not construct a vLLM pooling engine. "
-                               "Tried:\n  " + "\n  ".join(errors))
-        print(f"[serve] vLLM pooling engine up via {self.api}")
+    def __init__(self, endpoint: str, model: str, max_len: int = 384, **kw):
+        raise NotImplementedError(
+            "VLLMEncoder is yours to write. See VLLM_TASK.md, then run "
+            "`pytest tests/test_vllm_conformance.py -v`.")
 
     def encode(self, prompts: list[str]):
-        outs = self.llm.embed(prompts) if hasattr(self.llm, "embed") \
-            else self.llm.encode(prompts)
-        vecs, n_tok = [], []
-        for o in outs:
-            e = o.outputs.embedding if hasattr(o.outputs, "embedding") else o.outputs.data
-            vecs.append(torch.as_tensor(e, dtype=torch.float32))
-            n_tok.append(len(getattr(o, "prompt_token_ids", []) or []))
-        return torch.stack(vecs), n_tok
+        raise NotImplementedError
 
 
 # --------------------------------------------------------------------------- #
@@ -161,8 +154,7 @@ class GenRecService:
         self.model.to(device).eval()
 
         if backend == "vllm":
-            self.encoder = VLLMEncoder(os.path.join(model_dir, "backbone"),
-                                       max_len=max_len, **backend_kw)
+            self.encoder = VLLMEncoder(max_len=max_len, **backend_kw)
         else:
             self.encoder = TorchEncoder(self.model, self.tok, device,
                                         max_len=max_len, **backend_kw)
