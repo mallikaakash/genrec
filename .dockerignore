@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.pyc
+genrec_model_v2
+artifacts
+docs
+notebooks
+.DS_Store

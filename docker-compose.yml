@@ -1,0 +1,74 @@
+# Reproducible two-container GenRec: vLLM owns the GPU, our API owns the ranking.
+#
+#   1. python scripts/fetch_model.py          # -> ./genrec_model_v2
+#   2. docker compose up -d
+#   3. GENREC_MODEL_DIR=./genrec_model_v2 pytest tests/ -v
+#
+# REQUIRES a Linux host with an NVIDIA GPU and the NVIDIA Container Toolkit.
+# It will NOT run on Apple Silicon: vLLM needs CUDA, and Docker on macOS has no
+# GPU passthrough. Use a rented GPU box (RunPod / Lambda / EC2) or stay on Modal.
+services:
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    # POOLING, not generate: we want a hidden state, not tokens.
+    # These flags were renamed across vLLM releases. If the container exits with
+    # an argument error, check `docker run --rm vllm/vllm-openai:latest --help`
+    # and try `--task embed` instead of `--runner pooling --convert embed`.
+    command: >
+      --model /models/backbone
+      --served-model-name genrec-backbone
+      --runner pooling
+      --convert embed
+      --max-model-len 384
+      --gpu-memory-utilization 0.85
+      --dtype bfloat16
+    volumes:
+      - ./genrec_model_v2:/models:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  api:
+    build: .
+    environment:
+      GENREC_MODEL_DIR: /models
+      VLLM_URL: http://vllm:8000
+      GENREC_BACKEND: vllm          # flip to "torch" for the baseline
+    volumes:
+      - ./genrec_model_v2:/models:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      vllm:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

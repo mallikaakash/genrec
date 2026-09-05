@@ -6,3 +6,6 @@ data/*.json
 *.pt
 .DS_Store
 .venv/
+
+# downloaded checkpoints (1GB+)
+genrec_model*/
